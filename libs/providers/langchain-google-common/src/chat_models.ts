@@ -386,9 +386,37 @@ export abstract class ChatGoogleBase<AuthOptions>
     // Get the streaming parser of the response
     const stream = response.data as JsonStream;
     let usageMetadata: UsageMetadata | undefined;
+
+    // When streamFunctionCallArguments is enabled, the Gemini API sends
+    // per tool call:
+    //  1. A functionCall with name + empty args {} (start signal)
+    //  2. Multiple partialArgs chunks with actual argument data
+    //  3. A functionCall with empty args {} and no name (end signal)
+    //
+    // For parallel tool calls, signals repeat sequentially:
+    //   start(tool1) → partials(tool1) → end(tool1) →
+    //   start(tool2) → partials(tool2) → end(tool2)
+    //
+    // Unlike OpenAI/Anthropic, Gemini's partial args are complete JSON
+    // objects (not concatenable substrings) and the index resets to 0 for
+    // each tool call. We must accumulate per tool call and assign a
+    // provider-side incrementing index so LangChain core's _mergeLists /
+    // collapseToolCallChunks can group chunks correctly.
+    const isStreamingFunctionCalls =
+      parameters.streamFunctionCallArguments === true;
+
+    type ActiveToolCall = {
+      name: string;
+      id: string;
+      index: number;
+      accumulatedArgs: Record<string, unknown>;
+      hasPartialArgs: boolean;
+    };
+
+    let activeTool: ActiveToolCall | undefined;
+    let nextToolCallIndex = 0;
+
     // Loop until the end of the stream
-    // During the loop, yield each time we get a chunk from the streaming parser
-    // that is either available or added to the queue
     while (!stream.streamDone) {
       if (options.signal?.aborted) {
         return;
@@ -412,7 +440,7 @@ export abstract class ChatGoogleBase<AuthOptions>
           total_tokens: output.usageMetadata.totalTokenCount,
         };
       }
-      const chunk =
+      let chunk =
         output !== null
           ? this.connection.api.responseToChatGeneration({ data: output })
           : new ChatGenerationChunk({
@@ -424,6 +452,148 @@ export abstract class ChatGoogleBase<AuthOptions>
               }),
             });
       if (chunk) {
+        const msg = chunk.message as AIMessageChunk;
+
+        if (isStreamingFunctionCalls) {
+          // Classify this chunk's tool_call_chunks.
+          let startSignalName: string | undefined;
+          let startSignalId: string | undefined;
+          let hasEndSignal = false;
+          let hasPartials = false;
+
+          const tccList = msg.tool_call_chunks ?? [];
+
+          for (const tcc of tccList) {
+            if (tcc.args === "{}" && tcc.name) {
+              // Start signal: has a function name + empty args
+              startSignalName = tcc.name;
+              startSignalId = tcc.id ?? "";
+            } else if (tcc.args === "{}" && !tcc.name) {
+              // End signal: empty args, no function name
+              hasEndSignal = true;
+            } else if (tcc.args && tcc.args !== "{}") {
+              // Partial args: non-empty, non-placeholder args
+              hasPartials = true;
+            }
+          }
+
+          // --- Start signal: flush previous tool, create new one ---
+          if (startSignalName) {
+            // Flush the previous activeTool inline if it has accumulated args.
+            if (activeTool?.hasPartialArgs) {
+              const syntheticId =
+                activeTool.id || `call_${activeTool.name}`;
+              const flushChunk = new ChatGenerationChunk({
+                text: "",
+                message: new AIMessageChunk({
+                  content: "",
+                  tool_call_chunks: [
+                    {
+                      name: activeTool.name,
+                      args: JSON.stringify(activeTool.accumulatedArgs),
+                      id: syntheticId,
+                      index: activeTool.index,
+                      type: "tool_call_chunk" as const,
+                    },
+                  ],
+                }),
+              });
+              yield flushChunk;
+              await runManager?.handleLLMNewToken(
+                "",
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                { chunk: flushChunk }
+              );
+            }
+
+            // Create new activeTool with an incrementing index.
+            activeTool = {
+              name: startSignalName,
+              id: startSignalId ?? "",
+              index: nextToolCallIndex++,
+              accumulatedArgs: {},
+              hasPartialArgs: false,
+            };
+
+            // Emit start chunk with args: "" so the adapter emits
+            // tool-input-start. collapseToolCallChunks merges by index.
+            chunk = new ChatGenerationChunk({
+              text: chunk.text,
+              generationInfo: chunk.generationInfo,
+              message: new AIMessageChunk({
+                content: msg.content,
+                additional_kwargs: msg.additional_kwargs,
+                usage_metadata: msg.usage_metadata,
+                tool_call_chunks: [
+                  {
+                    name: activeTool.name,
+                    args: "",
+                    id: activeTool.id,
+                    index: activeTool.index,
+                    type: "tool_call_chunk" as const,
+                  },
+                ],
+              }),
+            });
+          }
+
+          // --- Accumulate partial args into the active tool ---
+          if (hasPartials && activeTool) {
+            for (const tcc of msg.tool_call_chunks ?? []) {
+              if (tcc.args && tcc.args !== "{}") {
+                activeTool.hasPartialArgs = true;
+                try {
+                  const parsed = JSON.parse(tcc.args) as Record<
+                    string,
+                    unknown
+                  >;
+                  for (const [k, v] of Object.entries(parsed)) {
+                    if (
+                      typeof v === "string" &&
+                      typeof activeTool.accumulatedArgs[k] === "string"
+                    ) {
+                      (activeTool.accumulatedArgs[k] as string) += v as string;
+                    } else {
+                      activeTool.accumulatedArgs[k] = v;
+                    }
+                  }
+                } catch {
+                  // Fragment is not valid JSON; skip accumulation
+                }
+              }
+            }
+
+            // Suppress tool_call_chunks from partial arg chunks so they
+            // don't get concatenated by _mergeLists and produce invalid JSON.
+            // Only the start and flush chunks should carry tool_call_chunks.
+            chunk = new ChatGenerationChunk({
+              text: chunk.text,
+              generationInfo: chunk.generationInfo,
+              message: new AIMessageChunk({
+                content: msg.content,
+                additional_kwargs: msg.additional_kwargs,
+                usage_metadata: msg.usage_metadata,
+              }),
+            });
+          }
+
+          // --- End signal: suppress tool_call_chunks ---
+          if (hasEndSignal && !startSignalName) {
+            chunk = new ChatGenerationChunk({
+              text: chunk.text,
+              generationInfo: chunk.generationInfo,
+              message: new AIMessageChunk({
+                content: msg.content,
+                additional_kwargs: msg.additional_kwargs,
+                usage_metadata: msg.usage_metadata,
+              }),
+            });
+          }
+        }
+
         yield chunk;
         await runManager?.handleLLMNewToken(
           chunk.text ?? "",
@@ -432,6 +602,64 @@ export abstract class ChatGoogleBase<AuthOptions>
           undefined,
           undefined,
           { chunk }
+        );
+      }
+    }
+
+    // Flush the last activeTool after the stream ends.
+    if (isStreamingFunctionCalls && activeTool) {
+      if (activeTool.hasPartialArgs) {
+        const syntheticId =
+          activeTool.id || `call_${activeTool.name}`;
+        const syntheticChunk = new ChatGenerationChunk({
+          text: "",
+          message: new AIMessageChunk({
+            content: "",
+            tool_call_chunks: [
+              {
+                name: activeTool.name,
+                args: JSON.stringify(activeTool.accumulatedArgs),
+                id: syntheticId,
+                index: activeTool.index,
+                type: "tool_call_chunk" as const,
+              },
+            ],
+          }),
+        });
+        yield syntheticChunk;
+        await runManager?.handleLLMNewToken(
+          "",
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          { chunk: syntheticChunk }
+        );
+      } else {
+        // No partial args arrived — legitimate no-args tool call.
+        const noArgChunk = new ChatGenerationChunk({
+          text: "",
+          message: new AIMessageChunk({
+            content: "",
+            tool_call_chunks: [
+              {
+                name: activeTool.name,
+                args: "{}",
+                id: activeTool.id,
+                index: activeTool.index,
+                type: "tool_call_chunk" as const,
+              },
+            ],
+          }),
+        });
+        yield noArgChunk;
+        await runManager?.handleLLMNewToken(
+          "",
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          { chunk: noArgChunk }
         );
       }
     }

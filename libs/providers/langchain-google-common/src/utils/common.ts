@@ -221,6 +221,10 @@ export function copyAIModelParamsInto(
     options?.speechConfig ?? params?.speechConfig ?? target?.speechConfig
   );
   ret.streaming = options?.streaming ?? params?.streaming ?? target?.streaming;
+  ret.streamFunctionCallArguments =
+    options?.streamFunctionCallArguments ??
+    params?.streamFunctionCallArguments ??
+    target?.streamFunctionCallArguments;
   const toolChoice = processToolChoice(
     options?.tool_choice,
     options?.allowed_function_names

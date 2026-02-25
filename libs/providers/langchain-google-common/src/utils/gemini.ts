@@ -68,6 +68,7 @@ import {
   GoogleAIModelRequestParams,
   GoogleAIToolType,
   GeminiSearchToolAttributes,
+GoogleThinkingLevel,
 } from "../types.js";
 import { GoogleAISafetyError } from "./safety.js";
 import { MediaBlob } from "../experimental/utils/media_core.js";
@@ -476,6 +477,9 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
       return {
         text: content.reasoning,
         thought: true,
+        ...(content.thoughtSignature
+          ? { thoughtSignature: content.thoughtSignature }
+          : {}),
       };
     } else {
       return null;
@@ -729,26 +733,47 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
     );
     let toolParts: GeminiPart[];
     if (isAIMessage(message) && !!message.tool_calls?.length) {
-      toolParts = message.tool_calls.map(
-        (toolCall): GeminiPart => ({
+      const fcSignatures =
+        (message.additional_kwargs?.functionCallSignatures as Record<
+          string,
+          string
+        >) ?? {};
+      toolParts = message.tool_calls.map((toolCall): GeminiPart => {
+        const part: GeminiPart = {
           functionCall: {
             name: toolCall.name,
             args: toolCall.args,
           },
-        })
-      );
+        };
+        const sig = fcSignatures[toolCall.name];
+        if (sig) {
+          part.thoughtSignature = sig;
+        }
+        return part;
+      });
     } else {
       toolParts = messageKwargsToParts(message.additional_kwargs);
     }
     const parts: GeminiPart[] = [...contentParts, ...toolParts];
 
-    const signatures: string[] =
-      (message?.additional_kwargs?.signatures as string[]) ?? [];
-    if (signatures.length === parts.length) {
-      for (let co = 0; co < signatures.length; co += 1) {
-        const signature = signatures[co];
-        if (signature && signature.length > 0) {
-          parts[co].thoughtSignature = signature;
+    // Signatures embedded in content blocks (from streaming) take priority.
+    // The positional additional_kwargs.signatures array becomes unreliable
+    // after chunk concatenation because _mergeLists appends string elements
+    // rather than merging them positionally, so signatures.length diverges
+    // from parts.length.  Only fall back to the array when no part already
+    // carries its own thoughtSignature.
+    const hasEmbeddedSignatures = parts.some(
+      (p) => p.thoughtSignature && p.thoughtSignature.length > 0
+    );
+    if (!hasEmbeddedSignatures) {
+      const signatures: string[] =
+        (message?.additional_kwargs?.signatures as string[]) ?? [];
+      if (signatures.length === parts.length) {
+        for (let co = 0; co < signatures.length; co += 1) {
+          const signature = signatures[co];
+          if (signature && signature.length > 0) {
+            parts[co].thoughtSignature = signature;
+          }
         }
       }
     }
@@ -852,6 +877,7 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
   type MessageContentReasoning = {
     type: "reasoning";
     reasoning: string;
+    thoughtSignature?: string;
   };
 
   function thoughtPartToMessageContent(
@@ -860,6 +886,9 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
     return {
       type: "reasoning",
       reasoning: part.text,
+      ...(part.thoughtSignature
+        ? { thoughtSignature: part.thoughtSignature }
+        : {}),
     };
   }
 
@@ -954,10 +983,78 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
       id: uuidv4().replace(/-/g, ""),
       type: "function",
       function: {
-        name: part.functionCall.name,
+        name: part.functionCall.name ?? "",
         arguments: part.functionCall.args ?? {},
       },
     };
+  }
+
+  /**
+   * Produce a deterministic tool-call ID from the function name and part
+   * index so that every streaming chunk for the same call maps to the
+   * same ID.  This lets downstream consumers (e.g. @ai-sdk/langchain)
+   * accumulate incremental `tool-input-delta` events correctly.
+   */
+  function stableToolCallId(name: string, partIndex: number): string {
+    let hash = 0x811c9dc5; // FNV-1a offset basis
+    const input = `${name}:${partIndex}`;
+    for (let i = 0; i < input.length; i += 1) {
+      hash ^= input.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    const hex = (hash >>> 0).toString(16).padStart(8, "0");
+    return `call_${hex}`;
+  }
+
+  /**
+   * Check if a function call part contains partial (streamed) arguments
+   * rather than complete arguments.
+   */
+  function isPartialFunctionCall(
+    part: GeminiPartFunctionCall
+  ): boolean {
+    return Array.isArray(part.functionCall.partialArgs);
+  }
+
+  /**
+   * Extract the value from a partial arg entry.
+   */
+  function partialArgValue(
+    arg: import("../types.js").GeminiPartialArg
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ): any {
+    if ("numberValue" in arg) return arg.numberValue;
+    if ("stringValue" in arg) return arg.stringValue;
+    if ("boolValue" in arg) return arg.boolValue;
+    if ("nullValue" in arg) return null;
+    return undefined;
+  }
+
+  /**
+   * Build a JSON string fragment from a list of partialArgs.
+   *
+   * The @ai-sdk/langchain adapter concatenates each chunk's `args` string
+   * into `inputTextDelta` which the UI assembles into the complete JSON.
+   * Gemini delivers structured partialArgs (jsonPath + typed value) rather
+   * than raw string fragments, so we serialise each set of partialArgs as
+   * a self-contained JSON object.  The adapter emits each as its own
+   * `tool-input-delta` event for the UI to display progressively.
+   */
+  function partialArgsToJsonFragment(
+    args: import("../types.js").GeminiPartialArg[]
+  ): string {
+    const obj: Record<string, unknown> = {};
+    for (const arg of args) {
+      const path = arg.jsonPath.replace(/^\$\./, "");
+      const value = partialArgValue(arg);
+      if (value !== undefined) {
+        obj[path] = value;
+      }
+    }
+    if (Object.keys(obj).length === 0) {
+      return "";
+    }
+    return JSON.stringify(obj);
   }
 
   function partsToToolsRaw(parts: GeminiPart[]): ToolCallRaw[] {
@@ -966,6 +1063,10 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
         if (part === undefined || part === null) {
           return null;
         } else if ("functionCall" in part) {
+          // Skip partial function calls - they are handled separately
+          if (isPartialFunctionCall(part)) {
+            return null;
+          }
           return functionCallPartToToolRaw(part);
         } else {
           return null;
@@ -1212,9 +1313,12 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
   function responseToChatGeneration(
     response: GoogleLLMResponse
   ): ChatGenerationChunk {
+    const parts = responseToParts(response);
+    const fields = partsToBaseMessageChunkFields(parts);
+    const message = new AIMessageChunk(fields);
     return new ChatGenerationChunk({
       text: responseToString(response),
-      message: partToMessageChunk(responseToParts(response)[0]),
+      message,
       generationInfo: responseToGenerationInfo(response),
     });
   }
@@ -1536,6 +1640,7 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
     };
     fields.additional_kwargs = {};
 
+    // Handle complete function calls
     const rawTools = partsToToolsRaw(parts);
     if (rawTools.length > 0) {
       const tools = toolsRawToTools(rawTools);
@@ -1567,7 +1672,65 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
       fields.additional_kwargs.tool_calls = tools;
     }
 
+    // Handle partial (streaming) function call arguments.
+    // The @ai-sdk/langchain adapter accumulates tool-input-delta events
+    // by matching tool_call_chunks using `index`.  The first chunk for a
+    // given index must carry `id` + `name` so the adapter can register it;
+    // subsequent chunks for the same index carry only `args` (the delta).
+    // Because this function is stateless (called once per streaming chunk),
+    // we always include `id` and `name` when `name` is present.  The
+    // adapter deduplicates via its `messageSeen` map, so repeated `id`
+    // values are fine – they just won't re-emit `tool-input-start`.
+    for (let partIdx = 0; partIdx < parts.length; partIdx += 1) {
+      const part = parts[partIdx];
+      if (
+        part &&
+        "functionCall" in part &&
+        isPartialFunctionCall(part)
+      ) {
+        const partialArgs = part.functionCall.partialArgs!;
+        const fragment = partialArgsToJsonFragment(partialArgs);
+        if (fragment) {
+          const name = part.functionCall.name;
+          const chunk: Record<string, unknown> = {
+            args: fragment,
+            index: partIdx,
+            type: "tool_call_chunk",
+          };
+          if (name) {
+            chunk.id = stableToolCallId(name, partIdx);
+            chunk.name = name;
+          }
+          fields.tool_call_chunks?.push(
+            chunk as typeof fields.tool_call_chunks extends (infer U)[]
+              ? U
+              : never
+          );
+        }
+      }
+    }
+
     fields.additional_kwargs.signatures = partsToSignatures(parts);
+
+    // Store thoughtSignature for function call parts keyed by name.
+    // During chunk merging, _mergeDicts merges objects recursively,
+    // so {reasoning: "sig"} + {} = {reasoning: "sig"} — the signature
+    // survives concatenation unlike the fragile positional array.
+    const fcSignatures: Record<string, string> = {};
+    for (const part of parts) {
+      if (
+        part &&
+        "functionCall" in part &&
+        !isPartialFunctionCall(part) &&
+        part.functionCall?.name &&
+        part.thoughtSignature
+      ) {
+        fcSignatures[part.functionCall.name] = part.thoughtSignature;
+      }
+    }
+    if (Object.keys(fcSignatures).length > 0) {
+      fields.additional_kwargs.functionCallSignatures = fcSignatures;
+    }
 
     return fields;
   }
@@ -1718,7 +1881,7 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
 
       // Map reasoningLevel to thinkingLevel if provided
       if (typeof parameters.reasoningLevel !== "undefined") {
-        const levelMap: Record<string, string> = {
+        const levelMap: Record<string, GoogleThinkingLevel> = {
           low: "LOW",
           medium: "MEDIUM",
           high: "HIGH",
@@ -1729,6 +1892,15 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
       // Direct thinkingLevel takes precedence over reasoningLevel
       if (typeof parameters.thinkingLevel !== "undefined") {
         ret.thinkingConfig.thinkingLevel = parameters.thinkingLevel;
+      }
+
+      // Auto-set includeThoughts when a thinkingLevel is configured but
+      // maxReasoningTokens was not explicitly provided (which already handles it).
+      if (
+        typeof ret.thinkingConfig.thinkingLevel !== "undefined" &&
+        typeof ret.thinkingConfig.includeThoughts === "undefined"
+      ) {
+        ret.thinkingConfig.includeThoughts = true;
       }
     }
 
@@ -1853,7 +2025,18 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
   function formatToolConfig(
     parameters: GoogleAIModelRequestParams
   ): GeminiRequest["toolConfig"] | undefined {
+    const streamArgs = parameters.streamFunctionCallArguments;
+
     if (!parameters.tool_choice || typeof parameters.tool_choice !== "string") {
+      // Even without tool_choice, emit toolConfig if streaming args is requested
+      if (streamArgs) {
+        return {
+          functionCallingConfig: {
+            mode: "auto",
+            streamFunctionCallArguments: true,
+          },
+        };
+      }
       return undefined;
     }
 
@@ -1862,6 +2045,7 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
         functionCallingConfig: {
           mode: parameters.tool_choice as "auto" | "any" | "none",
           allowedFunctionNames: parameters.allowed_function_names,
+          ...(streamArgs ? { streamFunctionCallArguments: true } : {}),
         },
       };
     }
@@ -1871,6 +2055,7 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
       functionCallingConfig: {
         mode: "any",
         allowedFunctionNames: [parameters.tool_choice],
+        ...(streamArgs ? { streamFunctionCallArguments: true } : {}),
       },
     };
   }
