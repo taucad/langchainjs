@@ -2106,6 +2106,7 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
     baseMessageToContent,
     responseToString: safeResponseToString,
     responseToChatGeneration: safeResponseToChatGeneration,
+    responseToUsageMetadata,
     chunkToString,
     responseToBaseMessage: safeResponseToBaseMessage,
     responseToChatResult: safeResponseToChatResult,
