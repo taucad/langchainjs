@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from "uuid";
+import { CrossProviderContentError } from "../cross_provider_content_error.js";
 import {
   ContentBlock,
   AIMessage,
@@ -627,6 +628,19 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
         return await messageContentMedia(content);
       case "reasoning":
         return messageContentReasoning(content as MessageContentReasoning);
+      case "thinking": {
+        const thinkingContent = content as {
+          type: "thinking";
+          thinking?: string;
+        };
+        if (thinkingContent.thinking && thinkingContent.thinking.length > 0) {
+          return {
+            text: thinkingContent.thinking,
+            thought: true,
+          };
+        }
+        return null;
+      }
       case "input_audio":
         if ("input_audio" in content) {
           return {
@@ -638,13 +652,7 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
         }
         break;
       default:
-        throw new Error(
-          `Unsupported type "${
-            content.type
-          }" received while converting message to message parts: ${JSON.stringify(
-            content
-          )}`
-        );
+        throw new CrossProviderContentError(String(content.type));
     }
     throw new Error(
       `Cannot coerce "${content.type}" message part into a string.`

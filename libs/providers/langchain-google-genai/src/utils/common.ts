@@ -49,6 +49,22 @@ import {
 } from "../types.js";
 import { assertNoEmptyStringEnums } from "./validate_schema.js";
 
+/**
+ * Duplicated from `@langchain/google-common` — `@langchain/google-genai` does not depend on that package.
+ */
+class CrossProviderContentError extends Error {
+  public readonly code = "CROSS_PROVIDER_CONTENT" as const;
+
+  public constructor(public readonly providerNativeType: string) {
+    super(
+      `Content block of type "${providerNativeType}" is not portable to the Google provider. ` +
+        `This usually means assistant history from another provider was replayed without normalization. ` +
+        `Switch back to the originating model or normalize via standard V1 content blocks.`
+    );
+    this.name = "CrossProviderContentError";
+  }
+}
+
 export const _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY =
   "__gemini_function_call_thought_signatures__";
 const DUMMY_SIGNATURE =
@@ -322,6 +338,32 @@ function _convertLangChainContentToPart(
         args: content.args,
       },
     };
+  } else if (content.type === "reasoning") {
+    const reasoning = content as MessageContentComplex & {
+      reasoning?: string;
+      thoughtSignature?: string;
+      signature?: string;
+    };
+    if (typeof reasoning.reasoning === "string" && reasoning.reasoning.length > 0) {
+      const thoughtSignature = reasoning.thoughtSignature ?? reasoning.signature;
+      return {
+        text: reasoning.reasoning,
+        thought: true,
+        ...(thoughtSignature ? { thoughtSignature } : {}),
+      };
+    }
+    return undefined;
+  } else if (content.type === "thinking") {
+    const thinkingContent = content as MessageContentComplex & {
+      thinking?: string;
+    };
+    if (typeof thinkingContent.thinking === "string" && thinkingContent.thinking.length > 0) {
+      return {
+        text: thinkingContent.thinking,
+        thought: true,
+      };
+    }
+    return undefined;
   } else if (
     content.type?.includes("/") &&
     // Ensure it's a single slash.
@@ -340,9 +382,9 @@ function _convertLangChainContentToPart(
     return undefined;
   } else {
     if ("type" in content) {
-      throw new Error(`Unknown content type ${content.type}`);
+      throw new CrossProviderContentError(String(content.type));
     } else {
-      throw new Error(`Unknown content ${JSON.stringify(content)}`);
+      throw new CrossProviderContentError("unknown");
     }
   }
 }
