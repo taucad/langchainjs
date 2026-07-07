@@ -2,6 +2,7 @@
 import { describe, expect, test, vi } from "vitest";
 import {
   AIMessage,
+  AIMessageChunk,
   BaseMessage,
   BaseMessageLike,
   HumanMessage,
@@ -3482,6 +3483,129 @@ test("Stream usage_metadata includes cache_read", async () => {
   expect(finalChunk?.usage_metadata?.input_token_details?.cache_read).toBe(5);
   expect(finalChunk?.usage_metadata?.output_token_details?.text).toBe(4);
   expect(finalChunk?.usage_metadata?.output_token_details?.reasoning).toBe(2);
+});
+
+test("Stream skips parser close sentinels", async () => {
+  const record: Record<string, unknown> = {};
+  const projectId = mockId();
+  const model = new ChatGoogle({
+    authOptions: {
+      record,
+      projectId,
+      resultFile: "chat-stream-usage-cache-mock.json",
+    },
+    streaming: true,
+  });
+
+  const chunks: AIMessageChunk[] = [];
+  for await (const chunk of await model.stream("Hello?")) {
+    chunks.push(chunk);
+  }
+
+  expect(chunks).toHaveLength(2);
+  expect(chunks.map((chunk) => chunk.content)).toEqual(["Hello", " world"]);
+});
+
+async function collectStreamFunctionCallArgumentChunks(): Promise<
+  AIMessageChunk[]
+> {
+  const record: Record<string, unknown> = {};
+  const projectId = mockId();
+  const model = new ChatGoogle({
+    authOptions: {
+      record,
+      projectId,
+      resultFile: "chat-stream-function-call-args-mock.json",
+    },
+    streaming: true,
+    streamFunctionCallArguments: true,
+  });
+
+  const chunks: AIMessageChunk[] = [];
+  for await (const chunk of await model.stream("Read main.ts")) {
+    chunks.push(chunk);
+  }
+  return chunks;
+}
+
+function getReadFileToolCallId(chunks: AIMessageChunk[]): string {
+  const readFileChunks = chunks
+    .flatMap((chunk) => chunk.tool_call_chunks ?? [])
+    .filter((chunk) => chunk.name === "read_file");
+  const ids = new Set(readFileChunks.map((chunk) => chunk.id));
+
+  expect(readFileChunks.length).toBeGreaterThanOrEqual(2);
+  expect(ids.size).toBe(1);
+
+  const [id] = [...ids];
+  if (!id) {
+    throw new Error("expected streamed read_file chunks to have an id");
+  }
+  expect(id.startsWith("lc-tool-call-")).toBe(true);
+  expect(id).not.toBe("call_ad6083d2");
+  return id;
+}
+
+test("streamFunctionCallArguments emits incremental chunks without legacy tool calls", async () => {
+  const chunks = await collectStreamFunctionCallArgumentChunks();
+
+  const legacyToolCalls = chunks.flatMap((chunk) => {
+    const toolCalls = chunk.additional_kwargs?.tool_calls;
+    return Array.isArray(toolCalls) ? toolCalls : [];
+  });
+  expect(legacyToolCalls).toEqual([]);
+
+  const readFileToolCallId = getReadFileToolCallId(chunks);
+  const toolChunks = chunks.flatMap((chunk) => chunk.tool_call_chunks ?? []);
+  expect(toolChunks).toContainEqual({
+    name: "read_file",
+    args: "",
+    id: readFileToolCallId,
+    index: 0,
+    type: "tool_call_chunk",
+  });
+  expect(toolChunks).toContainEqual({
+    name: "read_file",
+    args: JSON.stringify({ limit: 40, targetFile: "main.ts" }),
+    id: readFileToolCallId,
+    index: 0,
+    type: "tool_call_chunk",
+  });
+  expect(JSON.stringify(toolChunks)).not.toContain('"name":""');
+});
+
+test("streamFunctionCallArguments preserves Gemini function-call thought signatures for replay", async () => {
+  const chunks = await collectStreamFunctionCallArgumentChunks();
+  const [firstChunk, ...restChunks] = chunks;
+  if (!firstChunk) {
+    throw new Error("expected streamed chunks");
+  }
+
+  const aggregate = restChunks.reduce(
+    (message, chunk) => message.concat(chunk),
+    firstChunk
+  );
+
+  expect(aggregate.additional_kwargs?.signatures).toEqual(["decafe42"]);
+  expect(aggregate.tool_calls).toEqual([
+    {
+      name: "read_file",
+      args: { limit: 40, targetFile: "main.ts" },
+      id: getReadFileToolCallId(chunks),
+      type: "tool_call",
+    },
+  ]);
+});
+
+test("streamFunctionCallArguments assigns fresh ids per model stream", async () => {
+  const firstId = getReadFileToolCallId(
+    await collectStreamFunctionCallArgumentChunks()
+  );
+  const secondId = getReadFileToolCallId(
+    await collectStreamFunctionCallArgumentChunks()
+  );
+
+  expect(secondId).not.toBe(firstId);
 });
 
 describe("withStructuredOutput - StandardSchema", () => {

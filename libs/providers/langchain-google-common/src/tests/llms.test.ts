@@ -295,7 +295,7 @@ describe("Mock Google LLM", () => {
       responseArray.push(value);
     }
 
-    expect(responseArray).toHaveLength(6);
+    expect(responseArray).toHaveLength(5);
     // console.log("record", JSON.stringify(record, null, 2));
   });
 
@@ -400,7 +400,7 @@ describe("Mock Google LLM", () => {
       responseArray.push(value);
     }
 
-    expect(responseArray).toHaveLength(6);
+    expect(responseArray).toHaveLength(5);
     expect(responseArray[4]).toEqual("I'm sorry Dave, but I can't do that.");
     // console.log("record", JSON.stringify(record, null, 2));
   });
@@ -548,7 +548,7 @@ describe("Mock Google LLM", () => {
       responseArray.push(value);
     }
 
-    expect(responseArray).toHaveLength(3);
+    expect(responseArray).toHaveLength(2);
     // console.log("record", JSON.stringify(record, null, 2));
   });
 
@@ -572,7 +572,7 @@ describe("Mock Google LLM", () => {
       responseArray.push(value);
     }
 
-    expect(responseArray).toHaveLength(10);
+    expect(responseArray).toHaveLength(9);
     expect(typeof JSON.parse(responseArray.join(""))).toEqual("object");
 
     // console.log("record", JSON.stringify(record, null, 2));

@@ -20,6 +20,7 @@ import { type ModelProfile } from "@langchain/core/language_models/profile";
 import { Runnable } from "@langchain/core/runnables";
 import { AsyncCaller } from "@langchain/core/utils/async_caller";
 import { concat } from "@langchain/core/utils/stream";
+import { v4 as uuidv4 } from "@langchain/core/utils/uuid";
 import {
   InteropZodType,
   isInteropZodSchema,
@@ -421,6 +422,92 @@ export abstract class ChatGoogleBase<AuthOptions>
     const stream = response.data as JsonStream;
     const shouldStreamUsage =
       this.streamUsage !== false && options.streamUsage !== false;
+
+    const isStreamingFunctionCalls =
+      parameters.streamFunctionCallArguments === true;
+
+    type ActiveToolCall = {
+      name: string;
+      id: string;
+      index: number;
+      accumulatedArgs: Record<string, unknown>;
+      hasPartialArgs: boolean;
+      thoughtSignature?: string;
+    };
+
+    let activeTool: ActiveToolCall | undefined;
+    let nextToolCallIndex = 0;
+    const streamToolCallIdNamespace = uuidv4().replace(/-/g, "");
+    const streamToolCallId = (index: number): string =>
+      `lc-tool-call-${streamToolCallIdNamespace}-${index}`;
+
+    const streamingSafeAdditionalKwargs = (
+      kwargs: AIMessageChunk["additional_kwargs"]
+    ): AIMessageChunk["additional_kwargs"] => {
+      if (!kwargs) return kwargs;
+      const next = { ...kwargs };
+      delete next.tool_calls;
+      delete next.function_call;
+      delete next.signatures;
+      return Object.keys(next).length > 0 ? next : {};
+    };
+
+    const firstSignature = (
+      kwargs: AIMessageChunk["additional_kwargs"]
+    ): string | undefined => {
+      const signatures = kwargs?.signatures;
+      if (!Array.isArray(signatures)) return undefined;
+      return signatures.find(
+        (signature): signature is string =>
+          typeof signature === "string" && signature.length > 0
+      );
+    };
+
+    const chunkFromMessage = (
+      source: ChatGenerationChunk,
+      message: AIMessageChunk
+    ): ChatGenerationChunk =>
+      new ChatGenerationChunk({
+        text: source.text,
+        generationInfo: source.generationInfo,
+        message,
+      });
+
+    const emitToolFlush = async (
+      tool: ActiveToolCall
+    ): Promise<ChatGenerationChunk> => {
+      const args = tool.hasPartialArgs
+        ? JSON.stringify(tool.accumulatedArgs)
+        : "{}";
+      const chunk = new ChatGenerationChunk({
+        text: "",
+        message: new AIMessageChunk({
+          content: "",
+          additional_kwargs: tool.thoughtSignature
+            ? { signatures: [tool.thoughtSignature] }
+            : {},
+          tool_call_chunks: [
+            {
+              name: tool.name,
+              args,
+              id: tool.id,
+              index: tool.index,
+              type: "tool_call_chunk" as const,
+            },
+          ],
+        }),
+      });
+      await runManager?.handleLLMNewToken(
+        "",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { chunk }
+      );
+      return chunk;
+    };
+
     // Loop until the end of the stream
     // During the loop, yield each time we get a chunk from the streaming parser
     // that is either available or added to the queue
@@ -435,17 +522,13 @@ export abstract class ChatGoogleBase<AuthOptions>
           output,
         }
       );
+      if (output === null) {
+        continue;
+      }
 
-      const chunk =
-        output !== null
-          ? this.connection.api.responseToChatGeneration({ data: output })
-          : new ChatGenerationChunk({
-              text: "",
-              generationInfo: { finishReason: "stop" },
-              message: new AIMessageChunk({
-                content: "",
-              }),
-            });
+      let chunk = this.connection.api.responseToChatGeneration({
+        data: output,
+      });
 
       if (shouldStreamUsage && chunk) {
         chunk.message = new AIMessageChunk({
@@ -455,6 +538,120 @@ export abstract class ChatGoogleBase<AuthOptions>
       }
 
       if (chunk) {
+        const msg = chunk.message as AIMessageChunk;
+
+        if (isStreamingFunctionCalls) {
+          let startSignalName: string | undefined;
+          let hasPartials = false;
+
+          const toolCallChunks = msg.tool_call_chunks ?? [];
+          for (const toolCallChunk of toolCallChunks) {
+            if (toolCallChunk.args === "{}" && toolCallChunk.name) {
+              startSignalName = toolCallChunk.name;
+            } else if (
+              toolCallChunk.args &&
+              toolCallChunk.args !== "{}" &&
+              !toolCallChunk.name
+            ) {
+              hasPartials = true;
+            }
+          }
+
+          if (startSignalName) {
+            if (activeTool) {
+              yield await emitToolFlush(activeTool);
+            }
+
+            const activeToolIndex = nextToolCallIndex++;
+            activeTool = {
+              name: startSignalName,
+              id: streamToolCallId(activeToolIndex),
+              index: activeToolIndex,
+              accumulatedArgs: {},
+              hasPartialArgs: false,
+              thoughtSignature: firstSignature(msg.additional_kwargs),
+            };
+
+            chunk = chunkFromMessage(
+              chunk,
+              new AIMessageChunk({
+                content: msg.content,
+                additional_kwargs: streamingSafeAdditionalKwargs(
+                  msg.additional_kwargs
+                ),
+                response_metadata: msg.response_metadata,
+                usage_metadata: msg.usage_metadata,
+                tool_call_chunks: [
+                  {
+                    name: activeTool.name,
+                    args: "",
+                    id: activeTool.id,
+                    index: activeTool.index,
+                    type: "tool_call_chunk" as const,
+                  },
+                ],
+              })
+            );
+          } else if (!hasPartials) {
+            chunk = chunkFromMessage(
+              chunk,
+              new AIMessageChunk({
+                content: msg.content,
+                additional_kwargs: streamingSafeAdditionalKwargs(
+                  msg.additional_kwargs
+                ),
+                response_metadata: msg.response_metadata,
+                usage_metadata: msg.usage_metadata,
+                tool_call_chunks: msg.tool_call_chunks,
+              })
+            );
+          }
+
+          if (hasPartials && activeTool) {
+            for (const toolCallChunk of toolCallChunks) {
+              if (
+                toolCallChunk.args &&
+                toolCallChunk.args !== "{}" &&
+                !toolCallChunk.name
+              ) {
+                activeTool.hasPartialArgs = true;
+                try {
+                  const parsed = JSON.parse(toolCallChunk.args) as Record<
+                    string,
+                    unknown
+                  >;
+                  for (const [key, value] of Object.entries(parsed)) {
+                    if (
+                      typeof value === "string" &&
+                      typeof activeTool.accumulatedArgs[key] === "string"
+                    ) {
+                      activeTool.accumulatedArgs[key] =
+                        `${activeTool.accumulatedArgs[key]}${value}`;
+                    } else {
+                      activeTool.accumulatedArgs[key] = value;
+                    }
+                  }
+                } catch {
+                  // Ignore malformed intermediate fragments; the final model
+                  // output will still be validated by downstream tool parsing.
+                }
+              }
+            }
+
+            chunk = chunkFromMessage(
+              chunk,
+              new AIMessageChunk({
+                content: msg.content,
+                additional_kwargs: streamingSafeAdditionalKwargs(
+                  msg.additional_kwargs
+                ),
+                response_metadata: msg.response_metadata,
+                usage_metadata: msg.usage_metadata,
+              })
+            );
+          }
+        }
+
         yield chunk;
         await runManager?.handleLLMNewToken(
           chunk.text ?? "",
@@ -465,6 +662,10 @@ export abstract class ChatGoogleBase<AuthOptions>
           { chunk }
         );
       }
+    }
+
+    if (isStreamingFunctionCalls && activeTool) {
+      yield await emitToolFlush(activeTool);
     }
   }
 

@@ -1,0 +1,90 @@
+[
+  {
+    "candidates": [
+      {
+        "content": {
+          "parts": [
+            {
+              "functionCall": {
+                "name": "read_file",
+                "args": {}
+              },
+              "thoughtSignature": "decafe42"
+            }
+          ],
+          "role": "model"
+        },
+        "index": 0
+      }
+    ]
+  },
+  {
+    "candidates": [
+      {
+        "content": {
+          "parts": [
+            {
+              "functionCall": {
+                "name": "read_file",
+                "partialArgs": [
+                  {
+                    "jsonPath": "$.limit",
+                    "numberValue": 40
+                  }
+                ]
+              }
+            }
+          ],
+          "role": "model"
+        },
+        "index": 0
+      }
+    ]
+  },
+  {
+    "candidates": [
+      {
+        "content": {
+          "parts": [
+            {
+              "functionCall": {
+                "name": "read_file",
+                "partialArgs": [
+                  {
+                    "jsonPath": "$.targetFile",
+                    "stringValue": "main.ts"
+                  }
+                ]
+              }
+            }
+          ],
+          "role": "model"
+        },
+        "index": 0
+      }
+    ]
+  },
+  {
+    "candidates": [
+      {
+        "content": {
+          "parts": [
+            {
+              "functionCall": {
+                "args": {}
+              }
+            }
+          ],
+          "role": "model"
+        },
+        "finishReason": "STOP",
+        "index": 0
+      }
+    ],
+    "usageMetadata": {
+      "promptTokenCount": 5,
+      "candidatesTokenCount": 6,
+      "totalTokenCount": 11
+    }
+  }
+]

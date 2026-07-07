@@ -399,6 +399,12 @@ export interface GoogleAIModelParams extends GoogleModelParams {
    * as the name of a pre-defined voice).
    */
   speechConfig?: GoogleSpeechConfig | GoogleSpeechConfigSimplified;
+
+  /**
+   * When true, Gemini streams function-call arguments incrementally via
+   * `partialArgs` in the response.
+   */
+  streamFunctionCallArguments?: boolean;
 }
 
 export type GoogleAIToolType = BindToolsInput | GeminiTool;
@@ -519,9 +525,20 @@ export interface GeminiPartFileData extends GeminiPartBaseFile {
 // AI Studio only?
 export interface GeminiPartFunctionCall extends GeminiPartBase {
   functionCall: {
-    name: string;
+    name?: string;
     args?: object;
+    partialArgs?: GeminiPartialArg[];
+    willContinue?: boolean;
   };
+}
+
+export interface GeminiPartialArg {
+  jsonPath: string;
+  numberValue?: number;
+  stringValue?: string;
+  boolValue?: boolean;
+  nullValue?: null;
+  willContinue?: boolean;
 }
 
 // AI Studio Only?
@@ -759,6 +776,7 @@ export interface GeminiRequest {
     functionCallingConfig?: {
       mode: "auto" | "any" | "none";
       allowedFunctionNames?: string[];
+      streamFunctionCallArguments?: boolean;
     };
     /**
      * Required by the Gemini API when both server-side built-in tools

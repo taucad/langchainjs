@@ -68,6 +68,7 @@ import {
   GoogleAIModelRequestParams,
   GoogleAIToolType,
   GeminiSearchToolAttributes,
+  GeminiPartialArg,
 } from "../types.js";
 import { GoogleAISafetyError } from "./safety.js";
 import { MediaBlob } from "../experimental/utils/media_core.js";
@@ -1055,15 +1056,44 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
 
   function functionCallPartToToolRaw(
     part: GeminiPartFunctionCall
-  ): ToolCallRaw {
+  ): ToolCallRaw | null {
+    const name = part.functionCall.name;
+    if (!name) {
+      return null;
+    }
+
     return {
       id: uuidv4().replace(/-/g, ""),
       type: "function",
       function: {
-        name: part.functionCall.name,
+        name,
         arguments: part.functionCall.args ?? {},
       },
     };
+  }
+
+  function isPartialFunctionCall(part: GeminiPartFunctionCall): boolean {
+    return Array.isArray(part.functionCall.partialArgs);
+  }
+
+  function partialArgValue(arg: GeminiPartialArg): unknown {
+    if ("numberValue" in arg) return arg.numberValue;
+    if ("stringValue" in arg) return arg.stringValue;
+    if ("boolValue" in arg) return arg.boolValue;
+    if ("nullValue" in arg) return null;
+    return undefined;
+  }
+
+  function partialArgsToJsonFragment(args: GeminiPartialArg[]): string {
+    const obj: Record<string, unknown> = {};
+    for (const arg of args) {
+      const path = arg.jsonPath.replace(/^\$\./, "");
+      const value = partialArgValue(arg);
+      if (value !== undefined) {
+        obj[path] = value;
+      }
+    }
+    return Object.keys(obj).length > 0 ? JSON.stringify(obj) : "";
   }
 
   function partsToToolsRaw(parts: GeminiPart[]): ToolCallRaw[] {
@@ -1072,6 +1102,9 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
         if (part === undefined || part === null) {
           return null;
         } else if ("functionCall" in part) {
+          if (isPartialFunctionCall(part)) {
+            return null;
+          }
           return functionCallPartToToolRaw(part);
         } else {
           return null;
@@ -1673,6 +1706,22 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
       fields.additional_kwargs.tool_calls = tools;
     }
 
+    for (let partIdx = 0; partIdx < parts.length; partIdx += 1) {
+      const part = parts[partIdx];
+      if (part && "functionCall" in part && isPartialFunctionCall(part)) {
+        const fragment = partialArgsToJsonFragment(
+          part.functionCall.partialArgs ?? []
+        );
+        if (fragment) {
+          fields.tool_call_chunks?.push({
+            args: fragment,
+            index: partIdx,
+            type: "tool_call_chunk",
+          });
+        }
+      }
+    }
+
     fields.additional_kwargs.signatures = partsToSignatures(parts);
 
     return fields;
@@ -1984,6 +2033,8 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
     parameters: GoogleAIModelRequestParams,
     tools?: GeminiTool[]
   ): GeminiRequest["toolConfig"] | undefined {
+    const streamFunctionCallArguments =
+      parameters.streamFunctionCallArguments === true;
     const needsServerSideToolInvocations =
       tools && tools.length > 1 && mixesBuiltinAndFunctionTools(tools);
 
@@ -2011,6 +2062,16 @@ export function getGeminiAPI(config?: GeminiAPIConfig): GoogleAIAPI {
     if (needsServerSideToolInvocations) {
       config = config ?? {};
       config.includeServerSideToolInvocations = true;
+    }
+
+    if (streamFunctionCallArguments) {
+      config = config ?? {};
+      config.functionCallingConfig = {
+        mode: config.functionCallingConfig?.mode ?? "auto",
+        allowedFunctionNames:
+          config.functionCallingConfig?.allowedFunctionNames,
+        streamFunctionCallArguments: true,
+      };
     }
 
     return config;
